@@ -10,9 +10,9 @@ import {
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
-const CHECK_DELAY_MS = Number(process.env.CHECK_DELAY_MS || 1400);
-const MAX_AMOUNT = Math.min(Number(process.env.MAX_AMOUNT || 50), 100);
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 10000);
+const CHECK_DELAY_MS = Number(process.env.CHECK_DELAY_MS || 2200);
+const MAX_AMOUNT = Math.min(Number(process.env.MAX_AMOUNT || 30), 60);
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 12000);
 
 if (!TOKEN) {
   console.error('Missing DISCORD_TOKEN in Railway variables.');
@@ -26,16 +26,16 @@ const client = new Client({
 const commands = [
   new SlashCommandBuilder()
     .setName('check')
-    .setDescription('Generate and check possible TikTok usernames')
+    .setDescription('Generate and check possible short usernames')
     .addIntegerOption(option =>
       option
         .setName('length')
         .setDescription('Username length')
         .setRequired(true)
         .addChoices(
-          { name: '2 letters/chars', value: 2 },
-          { name: '3 letters/chars', value: 3 },
-          { name: '4 letters/chars', value: 4 }
+          { name: '2 chars', value: 2 },
+          { name: '3 chars', value: 3 },
+          { name: '4 chars', value: 4 }
         )
     )
     .addIntegerOption(option =>
@@ -65,6 +65,16 @@ const commands = [
       option
         .setName('usernames')
         .setDescription('Example: zooz, z0oz, z_oo, abcd')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('verify')
+    .setDescription('Check one username with detailed result')
+    .addStringOption(option =>
+      option
+        .setName('username')
+        .setDescription('Example: zooz')
         .setRequired(true)
     ),
 
@@ -102,9 +112,21 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
+    if (interaction.commandName === 'verify') {
+      const username = cleanUsername(interaction.options.getString('username', true));
+      if (!isValidUsername(username)) {
+        await interaction.reply({ content: 'Username غير صالح. استخدم حروف/أرقام/نقطة/underscore فقط.', ephemeral: true });
+        return;
+      }
+      await interaction.deferReply();
+      const result = await checkUsernameStrict(username);
+      await interaction.editReply({ embeds: [singleResultEmbed(result)] });
+      return;
+    }
+
     if (interaction.commandName === 'check') {
       const length = interaction.options.getInteger('length', true);
-      const amount = interaction.options.getInteger('amount') || 20;
+      const amount = interaction.options.getInteger('amount') || 15;
       const type = interaction.options.getString('type') || 'letters_numbers';
 
       await interaction.deferReply();
@@ -141,9 +163,13 @@ function normalizeList(text) {
   return [...new Set(
     text
       .split(/[\s,،]+/g)
-      .map(x => x.replace(/^@/, '').trim().toLowerCase())
+      .map(cleanUsername)
       .filter(isValidUsername)
   )];
+}
+
+function cleanUsername(value) {
+  return String(value || '').replace(/^@/, '').trim().toLowerCase();
 }
 
 function isValidUsername(username) {
@@ -163,7 +189,7 @@ function generateUniqueUsernames(length, amount, type) {
 
   const chars = sets[type] || sets.letters_numbers;
   const results = new Set();
-  const maxAttempts = amount * 100;
+  const maxAttempts = amount * 200;
   let attempts = 0;
 
   while (results.size < amount && attempts < maxAttempts) {
@@ -182,7 +208,7 @@ async function checkMany(usernames) {
   const results = [];
 
   for (const username of usernames) {
-    const result = await checkTikTokUsername(username);
+    const result = await checkUsernameStrict(username);
     results.push(result);
     await sleep(CHECK_DELAY_MS);
   }
@@ -190,54 +216,135 @@ async function checkMany(usernames) {
   return results;
 }
 
-async function checkTikTokUsername(username) {
+async function checkUsernameStrict(username) {
+  const apiResult = await checkByDetailEndpoint(username);
+
+  if (apiResult.status === 'taken') return apiResult;
+  if (apiResult.status === 'available') return apiResult;
+
+  const pageResult = await checkByProfilePage(username);
+
+  if (pageResult.status === 'taken') return pageResult;
+  if (pageResult.status === 'available') return pageResult;
+
+  return {
+    username,
+    status: 'unknown',
+    note: `${apiResult.note}; ${pageResult.note}`
+  };
+}
+
+async function checkByDetailEndpoint(username) {
+  const url = `https://www.tiktok.com/api/user/detail/?uniqueId=${encodeURIComponent(username)}`;
+
+  try {
+    const response = await fetchWithTimeout(url, {
+      headers: defaultHeaders()
+    });
+
+    const text = await response.text().catch(() => '');
+    const data = safeJson(text);
+
+    if (!data) return { username, status: 'unknown', note: `detail invalid JSON HTTP ${response.status}` };
+
+    const uniqueId = String(data?.userInfo?.user?.uniqueId || '').toLowerCase();
+    const statusCode = data?.statusCode;
+    const statusMsg = String(data?.statusMsg || '').toLowerCase();
+
+    if (uniqueId === username.toLowerCase()) {
+      return { username, status: 'taken', note: 'detail endpoint exact match' };
+    }
+
+    if (statusCode === 10202 || statusMsg.includes('user doesn')) {
+      return { username, status: 'available', note: 'detail endpoint not found' };
+    }
+
+    if (response.status === 403 || response.status === 429) {
+      return { username, status: 'unknown', note: `detail blocked HTTP ${response.status}` };
+    }
+
+    return { username, status: 'unknown', note: `detail unclear HTTP ${response.status}` };
+  } catch (error) {
+    return { username, status: 'unknown', note: error.name === 'AbortError' ? 'detail timeout' : 'detail failed' };
+  }
+}
+
+async function checkByProfilePage(username) {
+  const url = `https://www.tiktok.com/@${encodeURIComponent(username)}?lang=en`;
+
+  try {
+    const response = await fetchWithTimeout(url, {
+      redirect: 'follow',
+      headers: defaultHeaders()
+    });
+
+    const html = await response.text().catch(() => '');
+    const lower = html.toLowerCase();
+    const escaped = escapeRegExp(username.toLowerCase());
+
+    const exactUniqueId = new RegExp(`"uniqueId"\\s*:\\s*"${escaped}"`, 'i').test(html);
+    const exactCanonical = lower.includes(`/@${username.toLowerCase()}`);
+    const notFoundCode = /"statusCode"\s*:\s*10202/i.test(html);
+    const notFoundText = /couldn.?t find this account|account not found|user not found/i.test(html);
+    const botBlocked = /captcha|verify to continue|access denied|login-title|webapp/i.test(lower) && html.length < 30000;
+
+    if (exactUniqueId || exactCanonical) {
+      return { username, status: 'taken', note: 'profile page exact match' };
+    }
+
+    if (response.status === 404 || notFoundCode || notFoundText) {
+      return { username, status: 'available', note: 'profile page not found' };
+    }
+
+    if (response.status === 403 || response.status === 429 || botBlocked) {
+      return { username, status: 'unknown', note: `profile blocked/limited HTTP ${response.status}` };
+    }
+
+    return { username, status: 'unknown', note: `profile unclear HTTP ${response.status}` };
+  } catch (error) {
+    return { username, status: 'unknown', note: error.name === 'AbortError' ? 'profile timeout' : 'profile failed' };
+  }
+}
+
+async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    const url = `https://www.tiktok.com/@${encodeURIComponent(username)}`;
-    const response = await fetch(url, {
-      method: 'GET',
-      redirect: 'manual',
-      signal: controller.signal,
-      headers: {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
-        'accept-language': 'en-US,en;q=0.9'
-      }
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
     });
-
+  } finally {
     clearTimeout(timeout);
+  }
+}
 
-    if (response.status === 404) {
-      return { username, status: 'available', note: 'page not found' };
-    }
+function defaultHeaders() {
+  return {
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+    'accept': 'text/html,application/json;q=0.9,*/*;q=0.8',
+    'accept-language': 'en-US,en;q=0.9',
+    'cache-control': 'no-cache'
+  };
+}
 
-    if (response.status >= 200 && response.status < 400) {
-      const html = await response.text().catch(() => '');
-      const notFound = /Couldn't find this account|couldn.t find this account|user not found|statusCode":10202/i.test(html);
-      if (notFound) return { username, status: 'available', note: 'not found page' };
-      return { username, status: 'taken', note: `HTTP ${response.status}` };
-    }
-
-    if ([403, 429].includes(response.status)) {
-      return { username, status: 'unknown', note: `blocked/rate limited HTTP ${response.status}` };
-    }
-
-    return { username, status: 'unknown', note: `HTTP ${response.status}` };
-  } catch (error) {
-    clearTimeout(timeout);
-    return { username, status: 'unknown', note: error.name === 'AbortError' ? 'timeout' : 'request failed' };
+function safeJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
   }
 }
 
 function resultsEmbed(title, results) {
-  const available = results.filter(x => x.status === 'available').map(formatUser);
-  const taken = results.filter(x => x.status === 'taken').map(formatUser);
-  const unknown = results.filter(x => x.status === 'unknown').map(x => `@${x.username} — ${x.note}`);
+  const available = results.filter(x => x.status === 'available').map(formatUserWithNote);
+  const taken = results.filter(x => x.status === 'taken').map(formatUserWithNote);
+  const unknown = results.filter(x => x.status === 'unknown').map(formatUserWithNote);
 
   return new EmbedBuilder()
     .setTitle(`Zooz Username Checker — ${title}`)
-    .setDescription('TikTok does not provide a public official availability endpoint, so unknown results can happen because of rate limits or blocking.')
+    .setDescription('Strict mode: the bot only says Available when it gets a clear not-found signal. Anything blocked or unclear becomes Unknown, not Available.')
     .addFields(
       { name: `✅ Available (${available.length})`, value: block(available), inline: false },
       { name: `❌ Taken (${taken.length})`, value: block(taken), inline: false },
@@ -247,29 +354,46 @@ function resultsEmbed(title, results) {
     .setTimestamp();
 }
 
+function singleResultEmbed(result) {
+  const icon = result.status === 'taken' ? '❌' : result.status === 'available' ? '✅' : '⚠️';
+
+  return new EmbedBuilder()
+    .setTitle(`${icon} @${result.username}`)
+    .addFields(
+      { name: 'Result', value: result.status.toUpperCase(), inline: true },
+      { name: 'Reason', value: result.note || 'No note', inline: false }
+    )
+    .setTimestamp();
+}
+
 function helpEmbed() {
   return new EmbedBuilder()
     .setTitle('Zooz Bot Commands')
-    .setDescription('بوت فحص يوزرات تيك توك للديسكورد.')
+    .setDescription('بوت فحص يوزرات للديسكورد. النسخة الحالية Strict عشان ما يعطي Available كذب إذا تيك توك حظر الطلب.')
     .addFields(
-      { name: '/check', value: 'Generate random usernames and check them. Example: `/check length:4 amount:20 type:letters_numbers`' },
+      { name: '/verify', value: 'Check one username with detailed result. Example: `/verify username:zooz`' },
+      { name: '/check', value: 'Generate random usernames and check them. Example: `/check length:4 amount:15 type:letters_numbers`' },
       { name: '/checklist', value: 'Check your own list. Example: `/checklist usernames:zooz, z0oz, z_oo`' },
       { name: 'Railway variables', value: '`DISCORD_TOKEN`, `CLIENT_ID`, optional `GUILD_ID`, optional `CHECK_DELAY_MS`, optional `MAX_AMOUNT`' }
     );
 }
 
-function formatUser(result) {
-  return `@${result.username}`;
+function formatUserWithNote(result) {
+  return `@${result.username} — ${result.note}`;
 }
 
 function block(items) {
   if (!items.length) return 'None';
-  const text = items.slice(0, 25).join('\n');
+  const text = items.slice(0, 20).join('\n');
   return text.length > 1024 ? text.slice(0, 1010) + '\n...' : text;
 }
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 client.login(TOKEN);
