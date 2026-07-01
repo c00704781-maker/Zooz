@@ -1,0 +1,3 @@
+# Zooz
+
+Discord bot project.
